@@ -1,0 +1,96 @@
+import rospy
+import time
+import random
+from gazebo_msgs.msg import ModelState
+from gazebo_msgs.srv import GetModelState, GetModelStateRequest
+
+class Obstacle4():
+    def __init__(self):
+        # 初始化ROS节点
+        rospy.init_node('control_obstacle_4_random')
+
+        # 发布器：用于设置模型状态
+        self.pub_model = rospy.Publisher('/gazebo/set_model_state', ModelState, queue_size=10)
+
+        # 服务客户端：用于获取模型状态
+        self.get_state_service = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
+
+        # 定义障碍物的移动范围
+        self.x_min = 0.5  # X轴最小值
+        self.x_max = 2  # X轴最大值
+        self.y_min = -2  # Y轴最小值
+        self.y_max = 1  # Y轴最大值
+
+        # 定义速度范围
+        self.speed_min = 0.01  # 最小速度
+        self.speed_max = 0.03  # 最大速度
+
+        # 初始目标位置
+        self.target_x = random.uniform(self.x_min, self.x_max)
+        self.target_y = random.uniform(self.y_min, self.y_max)
+
+        # 初始速度
+        self.speed = random.uniform(self.speed_min, self.speed_max)
+
+    def moving(self):
+        while not rospy.is_shutdown():
+            try:
+                # 等待服务可用
+                rospy.wait_for_service('/gazebo/get_model_state')
+
+                # 获取障碍物4的当前状态
+                req = GetModelStateRequest()
+                req.model_name = 'obstacle_4'
+                model = self.get_state_service(req)
+
+                # 创建ModelState消息
+                obstacle_4 = ModelState()
+                obstacle_4.model_name = 'obstacle_4'
+                obstacle_4.pose = model.pose
+
+                # 计算当前位置与目标位置的距离
+                current_x = obstacle_4.pose.position.x
+                current_y = obstacle_4.pose.position.y
+                distance_to_target = ((current_x - self.target_x) ** 2 + (current_y - self.target_y) ** 2) ** 0.5
+
+                # 如果接近目标位置，生成新的随机目标位置和速度
+                if distance_to_target < 0.05:
+                    self.target_x = random.uniform(self.x_min, self.x_max)
+                    self.target_y = random.uniform(self.y_min, self.y_max)
+                    self.speed = random.uniform(self.speed_min, self.speed_max)  # 随机速度
+
+                # 计算方向向量
+                dx = self.target_x - current_x
+                dy = self.target_y - current_y
+                distance = (dx ** 2 + dy ** 2) ** 0.5
+
+                # 归一化方向向量
+                if distance > 0:
+                    dx /= distance
+                    dy /= distance
+
+                # 设置移动速度
+                obstacle_4.pose.position.x += dx * self.speed
+                obstacle_4.pose.position.y += dy * self.speed
+
+                # 发布更新后的模型状态
+                self.pub_model.publish(obstacle_4)
+
+                # 控制循环频率
+                time.sleep(0.1)
+
+            except rospy.ServiceException as e:
+                rospy.logerr(f"Service call failed: {e}")
+                break
+            except Exception as e:
+                rospy.logerr(f"An error occurred: {e}")
+                break
+
+if __name__ == '__main__':
+    try:
+        # 创建Obstacle4对象
+        obstacle4 = Obstacle4()
+        # 开始移动
+        obstacle4.moving()
+    except rospy.ROSInterruptException:
+        pass

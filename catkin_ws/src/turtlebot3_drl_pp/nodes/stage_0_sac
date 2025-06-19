@@ -1,0 +1,282 @@
+#!/usr/bin/env python3.9
+
+from copy import deepcopy
+import rospy
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.optim import Adam
+import time
+import datetime
+import os
+import sys
+import itertools
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+from src.envs.core import Env
+import src.sac.core as core
+import src.util.rb as rb
+from src.ddpg.icm import ICM
+from src.util.core import EpochDataSaver
+from std_msgs.msg import Float32, String, Empty, Float32MultiArray
+
+def sac(seed=0, start_epochs=0, max_epochs=200, save_freq_epochs=50, random_epochs=10, greedy_epochs=50,
+		max_epoch_steps=100, start_update_steps=512, update_freq_steps=50, batch_size=64,
+		replay_size=int(1e6), gamma=0.99, polyak=0.995, pi_lr=1e-4, q_lr=1e-3,
+		alpha=0.2, act_noise=0.1, e_greedy=0.95, target_noise=0.2, 
+		with_icm=True, with_ac=False, icm_lr=1e-4, icm_lambda_f=0.2, icm_lambda_i=1):
+
+	torch.manual_seed(seed)
+	np.random.seed(seed)
+
+	rospy.init_node('stage_0_sac')
+
+	env = Env()
+	eds = EpochDataSaver()
+
+	ac = core.SAC(env.obs_dim, env.act_dim)  # 初始化SAC模型
+
+	file_name = ''
+	if start_epochs != 0:
+		ac.load_state_dict(torch.load('/home/zsw/catkin_ws/src/turtlebot3_drl_pp/results/' + file_name + '.pt'))
+		eds.load_data_file(file_name)
+		print('DRL_Model: Load model from', file_name)
+
+	# 替换 deepcopy(ac) 为以下代码
+	ac_targ = core.SAC(env.obs_dim, env.act_dim)  # 创建一个新的 SAC 实例
+	ac_targ.load_state_dict(ac.state_dict())  # 复制参数
+
+
+	replay_buffer = rb.ReplayBuffer(obs_dim=env.obs_dim, act_dim=env.act_dim, size=replay_size)
+
+	if with_icm:
+		icm = ICM(env.obs_dim, env.scan_dim)
+		icm_optimizer = Adam(icm.parameters(), lr=icm_lr)
+		if with_ac:
+			ac_record_init = False
+			ac_record_count = 0
+			min_icm_pr = 0
+			avg_icm_pr = 0
+			max_icm_pr = 0
+			print('ICM_Module: Load AC-ICM Module')
+		else:
+			print('ICM_Module: Load ICM Module')
+
+	# 冻结目标网络的参数
+	for p in ac_targ.parameters():
+		p.requires_grad = False
+
+	# 设置优化器
+	q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
+	pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
+	q_optimizer = Adam(q_params, lr=q_lr)
+	alpha_optimizer = Adam([ac.log_alpha], lr=pi_lr)
+
+	# Set up function for computing SAC Q-loss
+	def compute_loss_q(data):
+		o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+        
+		q1 = ac.q1(o,a)
+		q2 = ac.q2(o,a)
+
+		# Bellman backup for Q function
+		with torch.no_grad():
+			a2, logp_a2 = ac.pi.sample(o2)
+			q1_pi_targ = ac_targ.q1(o2, a2)
+			q2_pi_targ = ac_targ.q2(o2, a2)
+			q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+			backup = r + gamma * (1 - d) * (q_pi_targ - ac.alpha * logp_a2)
+
+		# MSE loss against Bellman backup
+		loss_q1 = F.mse_loss(q1, backup)
+		loss_q2 = F.mse_loss(q2, backup)
+		loss_q = loss_q1 + loss_q2
+
+		return loss_q
+
+	def compute_loss_q_with_icm(data):
+		o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+		q1 = ac.q1(o, a)
+		q2 = ac.q2(o, a)
+
+		# ICM forward pass
+		pred_a, pred_phi2, phi2 = icm(o, o2, a)
+		
+		# Compute prediction errors
+		pred_errors = ((pred_phi2 - phi2.detach())**2).mean(1)
+		if with_ac:
+			# Update AC record
+			prs = torch.split(pred_errors, 1)
+			for pr in prs:
+				update_ac_record(pr.squeeze().clone())
+			# Compute AC intrinsic reward
+			pred_errors = pred_errors.detach().map_(pred_errors.detach(), compute_ac_intrinsic_reward) 
+		intrinsic_reward = icm_lambda_i * pred_errors
+
+		# ICM losses
+		loss_forward_model = ((pred_phi2 - phi2.detach())**2).mean()
+		loss_inverse_model = ((pred_a - a.detach())**2).mean()
+		loss_icm = (1 - icm_lambda_f) * loss_inverse_model + icm_lambda_f * loss_forward_model
+
+		# Bellman backup for Q function
+		with torch.no_grad():
+			a2, logp_a2 = ac.pi.sample(o2)
+			q1_pi_targ = ac_targ.q1(o2, a2)
+			q2_pi_targ = ac_targ.q2(o2, a2)
+			q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+			backup = r + gamma * (1 - d) * (q_pi_targ - ac.alpha * logp_a2) + intrinsic_reward
+
+		# MSE loss against Bellman backup
+		loss_q1 = F.mse_loss(q1, backup)
+		loss_q2 = F.mse_loss(q2, backup)
+		loss_q = loss_q1 + loss_q2
+
+		return loss_icm, loss_q
+                
+	def update_ac_record(pr):
+		nonlocal min_icm_pr
+		nonlocal max_icm_pr
+		nonlocal avg_icm_pr
+		nonlocal ac_record_count
+		nonlocal ac_record_init
+		if not ac_record_init:
+			min_icm_pr = pr
+			max_icm_pr = pr
+			avg_icm_pr = pr
+			ac_record_init = True
+		else:
+			if pr < min_icm_pr:
+				min_icm_pr = pr
+			if pr > max_icm_pr:
+				max_icm_pr = pr
+			avg_icm_pr = (avg_icm_pr * ac_record_count + pr) / (ac_record_count + 1)
+		ac_record_count += 1
+
+	def compute_ac_intrinsic_reward(x, *y):
+		nonlocal min_icm_pr
+		nonlocal max_icm_pr
+		nonlocal avg_icm_pr
+		a = (avg_icm_pr - min_icm_pr) / 2
+		b = (max_icm_pr - avg_icm_pr) / 2
+		if avg_icm_pr - a <= x <= avg_icm_pr:
+			x = 0.5 * (x - avg_icm_pr + a) / a
+		elif avg_icm_pr < x <= avg_icm_pr + b:
+			x = 0.5 + 0.5 * (x - avg_icm_pr) / b
+		else:
+			x = 0
+		return x
+    
+	# Set up function for computing SAC pi loss
+	def compute_loss_pi(data):
+		o = data['obs']
+		pi, logp_pi = ac.pi.sample(o)
+		q1_pi = ac.q1(o, pi)
+		q2_pi = ac.q2(o, pi)
+		q_pi = torch.min(q1_pi, q2_pi)
+		loss_pi = (ac.alpha * logp_pi - q_pi).mean()
+		return loss_pi, logp_pi
+
+	def update(data, timer):
+		if with_icm:
+			icm_optimizer.zero_grad()
+			q_optimizer.zero_grad()
+			
+			loss_icm, loss_q = compute_loss_q_with_icm(data)
+			
+			loss_icm.backward()
+			loss_q.backward()
+
+			icm_optimizer.step()
+			q_optimizer.step()
+		else:
+			# First run one gradient descent step for Q.
+			q_optimizer.zero_grad()
+			loss_q = compute_loss_q(data)
+			loss_q.backward()
+			q_optimizer.step()
+
+		# Next run one gradient descent step for pi.
+		pi_optimizer.zero_grad()
+		loss_pi, logp_pi = compute_loss_pi(data)
+		loss_pi.backward()
+		pi_optimizer.step()
+
+		# Finally, update target networks by polyak averaging.
+		with torch.no_grad():
+			for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
+				p_targ.data.mul_(polyak)
+				p_targ.data.add_((1 - polyak) * p.data)
+
+		# Update alpha
+		alpha_optimizer.zero_grad()
+		alpha_loss = -(ac.log_alpha * (logp_pi + ac.target_entropy).detach()).mean()
+		alpha_loss.backward()
+		alpha_optimizer.step()
+		ac.alpha = ac.log_alpha.exp()
+    
+	def get_action(o, noise, epsilon):
+		if np.random.uniform() >= epsilon:
+			random_vel = []
+			lin_vel = np.random.uniform(0, 1)
+			random_vel.append(lin_vel)
+			ang_vel = np.random.uniform(-1, 1)
+			random_vel.append(ang_vel)
+			return random_vel
+		else:
+			with torch.no_grad():
+				a, _ = ac.pi.sample(torch.as_tensor(o, dtype=torch.float32))
+				a = a.numpy()
+				a += noise * np.random.randn(env.act_dim)
+				return np.clip(a, [0, -1], [1, 1])
+
+	total_steps = 0
+
+	for e in range(max_epochs - start_epochs):
+		ep_start_time = time.time()
+		ep_ret, ep_len, ep_time = 0, 0, 0
+		o, dif = env.reset()
+		d = False
+		while not d:
+			if start_epochs + e + 1 <= random_epochs:
+				a = get_action(o, act_noise, 0)
+			elif random_epochs < start_epochs + e + 1 <= greedy_epochs:
+				a = get_action(o, act_noise, e_greedy)
+			else:
+				a = get_action(o, act_noise, 1)
+			o2, dif2, r, d, dr = env.step(a)
+			ep_ret += r
+			ep_len += 1
+			total_steps += 1
+			if ep_len == max_epoch_steps and not d:
+				d = True
+				dr = 'overstep'
+			replay_buffer.store(o, a, r, o2, d)
+
+			if with_ac:
+				with torch.no_grad():
+					pred_a, pred_phi2, phi2 = icm(torch.Tensor(o), torch.Tensor(o2), torch.Tensor(a))
+					pr = ((pred_phi2 - phi2)**2).mean()
+					update_ac_record(pr.clone())
+
+			o = o2
+			dif = dif2
+			if total_steps >= start_update_steps and total_steps % update_freq_steps == 0:
+				for j in range(update_freq_steps):
+					batch = replay_buffer.sample_batch(batch_size)
+					update(data=batch, timer=j)
+		
+		ep_time = round(time.time() - ep_start_time, 4)
+		ep_goal = '(' + str(env.goal.goal_x) + ',' + str(env.goal.goal_y) + ')'
+		eds.push_data(ep_goal, ep_ret, ep_len, ep_time, dr)
+		rospy.loginfo('EpochLogger: epoch=%s ep_ret=%f ep_len=%s ep_time=%s done_reason=%s', start_epochs + e + 1, ep_ret, ep_len, str(ep_time), dr)
+		
+		if (start_epochs + e + 1) % save_freq_epochs == 0:
+			name = 'stage_0_train_sac' + str(start_epochs + e + 1) + 'epochs_' + datetime.datetime.now().strftime("%Y-%m-%d-%H-%M")
+			# save drl model
+			torch.save(ac.state_dict(), '/home/zsw/catkin_ws/src/turtlebot3_drl_pp/results/' + name + '_icm.pt')    
+			# save exp data
+			eds.save_data_file(name)
+			eds.save_data_excel(name)
+	env.reset(end=True)
+
+if __name__ == '__main__':
+	sac()

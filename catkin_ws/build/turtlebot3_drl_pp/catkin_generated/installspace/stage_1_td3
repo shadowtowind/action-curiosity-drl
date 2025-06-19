@@ -1,0 +1,300 @@
+from copy import deepcopy
+import rospy
+import numpy as np
+import torch
+from torch.optim import Adam
+import time
+import datetime
+import math
+import os
+import sys
+import itertools
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+from src.envs.core import Env
+import src.td3.core as core
+import src.util.rb as rb
+from src.ddpg.icm import ICM
+from src.util.core import EpochDataSaver
+from std_msgs.msg import Float32, String, Empty, Float32MultiArray
+
+def td3(seed=0, start_epochs=0, max_epochs=2000, save_freq_epochs=200,
+		max_epoch_steps=100, start_update_steps=512, update_freq_steps=50, batch_size=64,
+		replay_size=int(1e6), gamma=0.99, polyak=0.995, pi_lr=1e-4, q_lr=1e-3,
+		act_noise=0.1, e_greedy=0.95, noise_clip=0.5, policy_delay=2, target_noise=0.2,
+		with_icm=True, with_ac=True, icm_lr=1e-4, icm_lambda_f=0.2, icm_lambda_i=0.5):
+
+	torch.manual_seed(seed)
+	np.random.seed(seed)
+
+	rospy.init_node('stage_1_td3')
+
+	env = Env()
+	eds = EpochDataSaver()
+
+	ac = core.td3(env.obs_dim, env.act_dim)
+
+	# file_name = '2024-c/td3-acm/stage_0_train_200epochs_2024-08-05-12-11_icm'
+	# file_name = '2024-c/td3-acm/stage_0_train_200epochs_2024-08-08-03-33'
+	# file_name = '2024-c/td3-acm/stage_0_train_200epochs_2024-08-09-07-06_acm'
+	file_name = '2023/td3/stage_0_200epochs_2023-01-27-21-48'
+	
+	ac.load_state_dict(torch.load('/home/zsw/catkin_ws/src/turtlebot3_drl_pp/results/'+file_name+'.pt'))
+	print('DRL_Model: Load model from', file_name)
+	
+	if start_epochs!=0:
+		eds.load_data_file(file_name)
+
+	ac_targ = deepcopy(ac)
+
+	replay_buffer = rb.ReplayBuffer(obs_dim=env.obs_dim, act_dim=env.act_dim, size=replay_size)
+	
+	if with_icm:
+		icm = ICM(env.obs_dim, env.scan_dim)
+		icm_optimizer = Adam(icm.parameters(), lr=icm_lr)
+		if with_ac:
+			ac_record_init = False
+			ac_record_count = 0
+			min_icm_pr = 0
+			avg_icm_pr = 0
+			max_icm_pr = 0
+			print('ICM_Module: Load AC-ICM Module')
+		else:
+			print('ICM_Module: Load ICM Module')
+			
+	# Freeze target networks with respect to optimizers (only update via polyak averaging)
+	for p in ac_targ.parameters():
+		p.requires_grad = False
+
+	q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
+	
+
+	# Set up optimizers for policy and q-function
+	pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
+	q_optimizer = Adam(q_params, lr=q_lr)
+
+	# Set up function for computing DDPG Q-loss
+	def compute_loss_q(data):
+		o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+		
+		q1 = ac.q1(o,a)
+		q2 = ac.q2(o,a)
+
+		# Bellman backup for Q function
+		with torch.no_grad():
+			pi_targ = ac_targ.pi(o2)
+
+			# Target policy smoothing
+			epsilon = torch.randn_like(pi_targ) * target_noise
+			epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
+			a2 = pi_targ + epsilon
+			# a2 = torch.clamp(a2, -act_limit, act_limit)
+			a2 = torch.clamp(a2, -1, 1)
+
+			# Target Q-values
+			q1_pi_targ = ac_targ.q1(o2, a2)
+			q2_pi_targ = ac_targ.q2(o2, a2)
+			q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+			backup = r + gamma * (1 - d) * q_pi_targ
+
+		# MSE loss against Bellman backup
+		loss_q1 = ((q1 - backup)**2).mean()
+		loss_q2 = ((q2 - backup)**2).mean()
+		loss_q = loss_q1 + loss_q2
+
+		return loss_q
+
+	def compute_loss_q_with_icm(data):
+		o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+		q1 = ac.q1(o,a)
+		q2 = ac.q2(o,a)
+
+
+		pred_a, pred_phi2, phi2 = icm(o, o2, a)
+		
+		# pred_errors = ((pred_phi2 - phi2.detach())**2).sum(axis=1)
+		pred_errors = ((pred_phi2.detach() - phi2.detach())**2).mean(1)
+		if with_ac:
+			# update ac record
+			prs = torch.split(pred_errors, 1)
+			for pr in prs:
+				update_ac_record(pr.squeeze().clone())
+			# compute ac reward
+			pred_errors.map_(pred_errors, compute_ac_intrinsic_reward)
+		intrinsic_reward = icm_lambda_i * pred_errors
+
+		loss_forward_model = ((pred_phi2 - phi2.detach())**2).mean()
+		loss_inverse_model = ((pred_a - a.detach())**2).mean()
+		loss_icm = (1 - icm_lambda_f) * loss_inverse_model + icm_lambda_f * loss_forward_model
+
+		# Bellman backup for Q function
+		with torch.no_grad():
+			pi_targ = ac_targ.pi(o2)
+
+			# Target policy smoothing
+			epsilon = torch.randn_like(pi_targ) * target_noise
+			epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
+			a2 = pi_targ + epsilon
+			# a2 = torch.clamp(a2, -act_limit, act_limit)
+			a2 = torch.clamp(a2, -1, 1)
+
+			# Target Q-values
+			q1_pi_targ = ac_targ.q1(o2, a2)
+			q2_pi_targ = ac_targ.q2(o2, a2)
+			q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+			backup = r + gamma * (1 - d) * q_pi_targ + intrinsic_reward
+
+		# MSE loss against Bellman backup
+		loss_q1 = ((q1 - backup)**2).mean()
+		loss_q2 = ((q2 - backup)**2).mean()
+		loss_q = loss_q1 + loss_q2
+
+		return loss_icm, loss_q
+				
+	def update_ac_record(pr):
+		nonlocal min_icm_pr
+		nonlocal max_icm_pr
+		nonlocal avg_icm_pr
+		nonlocal ac_record_count
+		nonlocal ac_record_init
+		if not ac_record_init:
+			min_icm_pr = pr
+			max_icm_pr = pr
+			avg_icm_pr = pr
+			ac_record_init = True
+		else:
+			if pr < min_icm_pr:
+				min_icm_pr = pr
+			if pr > max_icm_pr:
+				max_icm_pr = pr
+			avg_icm_pr = (avg_icm_pr * ac_record_count + pr) / (ac_record_count + 1)
+		ac_record_count += 1
+
+	def compute_ac_intrinsic_reward(x, *y):
+		nonlocal min_icm_pr
+		nonlocal max_icm_pr
+		nonlocal avg_icm_pr
+		a = (avg_icm_pr - min_icm_pr) / 2
+		b = (max_icm_pr - avg_icm_pr) / 2
+		if avg_icm_pr - a <= x <= avg_icm_pr:
+			x = 0.5 * (x - avg_icm_pr + a) / a
+		elif avg_icm_pr < x <= avg_icm_pr + b:
+			x = 0.5 + 0.5 * (x - avg_icm_pr) / b
+		else:
+			x = 0
+		return x
+		
+	# Set up function for computing DDPG pi loss
+	def compute_loss_pi(data):
+		o = data['obs']
+		q1_pi = ac.q1(o, ac.pi(o))
+		return -q1_pi.mean()
+
+	def update(data, timer):
+		if with_icm:
+			icm_optimizer.zero_grad()
+			q_optimizer.zero_grad()
+			
+			loss_icm, loss_q = compute_loss_q_with_icm(data)
+			
+			loss_icm.backward()
+			loss_q.backward()
+
+			icm_optimizer.step()
+			q_optimizer.step()
+		else:
+			# First run one gradient descent step for Q.
+			q_optimizer.zero_grad()
+			loss_q = compute_loss_q(data)
+			loss_q.backward()
+			q_optimizer.step()
+
+		if timer % policy_delay == 0:
+			# Freeze Q-network so you don't waste computational effort 
+			# computing gradients for it during the policy learning step.
+			for p in q_params:
+				p.requires_grad = False
+
+			# Next run one gradient descent step for pi.
+			pi_optimizer.zero_grad()
+			loss_pi = compute_loss_pi(data)
+			loss_pi.backward()
+			pi_optimizer.step()
+
+			# Unfreeze Q-network so you can optimize it at next DDPG step.
+			for p in q_params:
+				p.requires_grad = True
+
+			# Finally, update target networks by polyak averaging.
+			with torch.no_grad():
+				for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
+					# NB: We use an in-place operations "mul_", "add_" to update target
+					# params, as opposed to "mul" and "add", which would make new tensors.
+					p_targ.data.mul_(polyak)
+					p_targ.data.add_((1 - polyak) * p.data)
+	
+	def get_action(o, noise, epsilon):
+		if np.random.uniform() >= epsilon:
+			random_vel = []
+			lin_vel = np.random.uniform(0,1)
+			random_vel.append(lin_vel)
+			ang_vel = np.random.uniform(-1,1)
+			random_vel.append(ang_vel)
+			return random_vel
+		else:
+			a = ac.act(torch.as_tensor(o, dtype=torch.float32))
+			a += noise * np.random.randn(env.act_dim)
+			return np.clip(a, [0, -1], [1, 1])
+
+	total_steps = 0
+
+	for e in range(max_epochs-start_epochs):
+		ep_start_time = time.time()
+		ep_ret, ep_len, ep_time = 0, 0, 0
+		o, dif = env.reset()
+		d = False
+		while(d == False):
+			a = get_action(o, act_noise, e_greedy)
+			o2, dif2, r, d, dr = env.step(a)
+			ep_ret += r
+			ep_len += 1
+			total_steps += 1
+			if ep_len == max_epoch_steps and d == False:
+				d = True
+				dr = 'overstep'
+			replay_buffer.store(o, a, r, o2, d)
+
+			if with_ac:
+				with torch.no_grad():
+					pred_a, pred_phi2, phi2 = icm(torch.Tensor(o), torch.Tensor(o2), torch.Tensor(a))
+					pr = ((pred_phi2 - phi2)**2).mean()
+					update_ac_record(pr.clone())
+					
+			o = o2
+			dif = dif2
+			if total_steps >= start_update_steps and total_steps % update_freq_steps == 0:
+				for j in range(update_freq_steps):
+					batch = replay_buffer.sample_batch(batch_size)
+					update(data=batch, timer=j)
+
+		if start_epochs+e+1 > 500:
+			icm_lambda_i = 0
+		else:
+			# cosine annealing
+			icm_lambda_i = icm_lambda_i * 0.5 * (1 + math.cos(math.pi * (start_epochs+e+1) / 500))
+					
+		ep_time = round(time.time() - ep_start_time, 4)
+		ep_goal = '(' + str(env.goal.goal_x) + ',' + str(env.goal.goal_y) + ')'
+		eds.push_data(ep_goal, ep_ret, ep_len, ep_time, dr)
+		rospy.loginfo('EpochLogger: epoch=%s ep_ret=%f ep_len=%s ep_time=%s done_reason=%s', start_epochs+e+1, ep_ret, ep_len, str(ep_time), dr)
+		
+		if (start_epochs+e+1) %	save_freq_epochs == 0:
+			name = 'stage_1_train_'+ str(start_epochs+e+1) + 'epochs_'+datetime.datetime.now().strftime("%Y-%m-%d-%H-%M")
+			# save drl model
+			torch.save(ac.state_dict(), '/home/zsw/catkin_ws/src/turtlebot3_drl_pp/results/'+name+'_acm.pt')
+			# save exp data
+			eds.save_data_file(name)
+			eds.save_data_excel(name)
+	env.reset(end=True)
+
+if __name__ == '__main__':
+	td3()

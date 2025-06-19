@@ -1,0 +1,12 @@
+<launch>
+  
+  <arg name="stage" default="0"/>
+  <arg name="algo" default="sac"/>
+  
+  <include file="$(find turtlebot3_drl_pp)/launch/stage_$(arg stage).launch">  
+    <arg name="name" value="agent"/>
+  </include>
+  
+  <node pkg="turtlebot3_drl_pp" type="stage_$(arg stage)_$(arg algo)" name="stage_$(arg stage)_$(arg algo)" output="screen" />
+  
+</launch>

@@ -1,0 +1,6 @@
+gazebo-plugins                2.9.2               
+gazebo-ros                    2.9.2
+numpy                         1.21.6  
+openpyxl                      3.1.5
+torch                         1.11.0+cpu      
+tf                            1.13.2 

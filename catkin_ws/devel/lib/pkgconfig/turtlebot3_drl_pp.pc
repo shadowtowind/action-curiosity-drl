@@ -1,0 +1,8 @@
+prefix=/home/zsw/catkin_ws/devel
+
+Name: turtlebot3_drl_pp
+Description: Description of turtlebot3_drl_pp
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

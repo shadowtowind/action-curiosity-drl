@@ -1,0 +1,56 @@
+from copy import deepcopy
+import rospy
+import numpy as np
+import torch
+from torch.optim import Adam
+import time
+import datetime
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+from src.envs.core import Env
+import src.td3.core as core
+from src.util.core import EpochDataSaver
+from std_msgs.msg import Float32, String, Empty, Float32MultiArray
+
+def td3_test(seed=0, test_epochs=500):
+
+	torch.manual_seed(seed)
+	np.random.seed(seed)
+
+	rospy.init_node('stage_2_td3_test')
+
+	env = Env()
+	eds = EpochDataSaver()
+
+	ac = core.td3(env.obs_dim, env.act_dim)
+
+	file_name=''
+	ac.load_state_dict(torch.load('/home/zsw/catkin_ws/src/turtlebot3_drl_pp/results/'+file_name+'.pt'))
+	print('DRL_Model: Load model from', file_name)
+
+	def get_action(o):
+		a = ac.act(torch.as_tensor(o, dtype=torch.float32))
+		return a
+
+	for e in range(test_epochs):
+		ep_start_time = time.time()
+		o, ep_ret, ep_len, ep_time = env.reset(), 0, 0, 0
+		d = False
+		while(d == False):
+			a = get_action(o)
+			o2, r, d, dr = env.step(a)
+			ep_ret += r
+			ep_len += 1
+			o = o2
+
+		ep_time = round(time.time() - ep_start_time, 4)
+		eds.push_data(ep_ret, ep_len, ep_time, dr)
+		rospy.loginfo('EpochLogger: epoch=%s ep_ret=%f ep_len=%s ep_time=%s done_reason=%s', e+1, ep_ret, ep_len, str(ep_time), dr)
+			
+	name = 'stage_2_test_'+ str(test_epochs) + 'epochs_'+datetime.datetime.now().strftime("%Y-%m-%d-%H-%M")
+	eds.save_data_excel(name)
+	env.reset(end=True)
+
+if __name__ == '__main__':
+	td3_test()
