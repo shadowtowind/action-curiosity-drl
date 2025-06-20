@@ -24,7 +24,7 @@ The main process code is in ~/catkin_ws/src/turtlebot3_drl_pp/
 
 ### 2.Operation process
 
-After the environment is set up, please type the following commands in sequence in the linux command line to run the code
+After the environment is set up, please type the following commands in sequence in the linux command line to run this code
 
 cd ~/catkin_ws
 
@@ -32,6 +32,7 @@ catkin_make -DPYTHON_EXECUTABLE=/usr/bin/python3.9
 
 roslaunch turtlebot3_drl_pp stage_xx_xx.launch
 
+![111](https://github.com/user-attachments/assets/97f0d4f5-be51-4c17-bf6d-d08a22dd3342)
 
 # Citation
 If you find this project useful in your research, please consider citing our paper:
