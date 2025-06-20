@@ -17,7 +17,9 @@ The code needs to run under Ubuntu20.04, installation tutorial may refer to: htt
 
 On this basis, the code needs to the construction of the environment, ROS robot installation tutorial may refer to: https://blog.csdn.net/qq_33361420/article/details/118222009.
 
-The software packages required during the code execution can be installed according to the instructions in run.txt.
+The software packages required during the code execution can be installed according to the instructions in run.txt. 
+
+The main process code is in ~/catkin_ws/src/turtlebot3_drl_pp/
 
 
 ### 2.Operation process
